@@ -1,8 +1,9 @@
 package yeelight
 
 import (
-	"bufio"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
 	"net"
@@ -11,170 +12,261 @@ import (
 	"time"
 )
 
+// Interface guard
+var _ Yeelight = (*yeelight)(nil)
+
+// Yeelight is a light device you want to control
+type Yeelight interface {
+	// Send given Method and args to current yeelight device
+	Send(method Method, args ...interface{}) (*Response, error)
+
+	// On turns on the yeelight
+	On() error
+
+	// Off turns off the yeelight
+	Off() error
+
+	// SetColorTemperature will set the yeelight color temperature
+	SetColorTemperature(temp uint16) error
+
+	// SetRGB will set yeelight red, green and blue values
+	SetRGB(red, green, blue uint8) error
+
+	// GetRGB returns the current yeelight RGB value
+	GetRGB() (uint8, uint8, uint8, error)
+
+	// SetBrightness will set the yeelight brightness.
+	SetBrightness(brightness uint8) error
+
+	// IsPowerOn return whether the yeelight is power on
+	IsPowerOn() (bool, error)
+
+	// Toggle on or off the Yeelight
+	Toggle() error
+
+	// Listen for events that happend on current Yeelight
+	Listen(ctx context.Context) (<-chan *Notification, error)
+}
+
 type (
-	// command is send to the light yeelight.
+	// Method describes the method string to send to a yeelight
+	Method string
+
+	yeelight struct {
+		sync.Mutex
+		name string
+		addr string     // ip address
+		rnd  *rand.Rand // random seed for commands
+	}
+
+	// request body to Send to a yeelight device
 	command struct {
+		// ID is filled by message sender.
+		// It will be echoed back in RESULT message.
+		// This is to help request sender to correlate request and Response.
 		ID     int           `json:"id"`
-		Method string        `json:"method"`
+		Method Method        `json:"method"`
 		Params []interface{} `json:"params"`
 	}
 
-	// commandResult represents response from Yeelight device
-	commandResult struct {
+	// Notification describes a change on Yeelight
+	Notification struct {
+		Method Method            `json:"method"`
+		Params map[string]string `json:"params"`
+	}
+
+	// Response describes command response from a yeelight device
+	Response struct {
 		ID     int           `json:"id"`
-		Result []interface{} `json:"result,omitempty"`
-		Error  *Error        `json:"error,omitempty"`
+		Result []interface{} `json:"result"`
+		Error  *struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
 	}
-
-	//Error struct represents error part of response
-	Error struct {
-		Code    int    `json:"code"`
-		Message string `json:"message"`
-	}
-
-	// Yeelight struct is used to control the lights.
-	Yeelight struct {
-		mu   sync.Mutex
-		addr string
-		rnd  *rand.Rand
-		Name string
-	}
-
-	// method describes the method to send to the light yeelight.
-	method string
 )
 
+// Currently supported commands
 const (
-	// timeout value for TCP and UDP commands
-	timeout = time.Second * 1
-
-	// CR-LF delimiter
-	crlf = "\r\n"
+	SetCTABX      Method = "set_ct_abx"
+	SetRGB        Method = "set_rgb"
+	SetHSV        Method = "set_hsv"
+	SetBrightness Method = "set_bright"
+	SetPower      Method = "set_power"
+	Toggle        Method = "toggle"
+	GetProp       Method = "get_prop"
+	Props         Method = "props"
 )
 
-var (
-	MethodSetCTABX      method = "set_ct_abx"
-	MethodSetRGB        method = "set_rgb"
-	MethodSetHSV        method = "set_hsv"
-	MethodSetBrightness method = "set_bright"
-	MethodSetPower      method = "set_power"
-	MethodToggle        method = "toggle"
-	MethodGetProp       method = "get_prop"
+// each command and result end with this characters
+const (
+	crlf        = "\r\n"
+	discoverMSG = "M-SEARCH * HTTP/1.1\r\n HOST:239.255.255.250:1982\r\n MAN:\"ssdp:discover\"\r\n ST:wifi_bulb\r\n"
+	ssdpAddr    = "239.255.255.250:1982"
 )
 
-// Convert a method to string
-func (m *method) String() string {
-	if m == nil {
-		return ""
+// Discover tries to discover a Yeelight on your local network
+func Discover() error {
+	addr, err := net.ResolveUDPAddr("udp4", ssdpAddr)
+	if err != nil {
+		return err
 	}
-	return string(*m)
+
+	pc, err := net.ListenPacket("udp4", ":0")
+	if err != nil {
+		return err
+	}
+
+	socket := pc.(*net.UDPConn)
+	if _, err := socket.WriteToUDP([]byte(discoverMSG), addr); err != nil {
+		return err
+	}
+
+	_ = socket.SetReadDeadline(time.Now().Add(time.Second * 3))
+	buf := make([]byte, 1024)
+	n, _, err := socket.ReadFromUDP(buf)
+	if err != nil {
+		return errors.New("no device found")
+	}
+
+	fmt.Printf("%s sent this: %s\n", addr, buf[:n])
+	return pc.Close()
 }
 
-// New creates a new Yeelight object.
-func New(address, name string) (*Yeelight, error) {
+// New creates a new yeelight object.
+func New(address, name string) (Yeelight, error) {
 	if !strings.Contains(address, ":") {
 		address += ":55443"
 	}
 
-	return &Yeelight{
-		addr: address,
-		rnd:  rand.New(rand.NewSource(time.Now().UnixNano())),
-		Name: name,
+	if name == "" {
+		name = address
+	}
+
+	return &yeelight{
+		name:  name,
+		addr:  address,
+		rnd:   rand.New(rand.NewSource(time.Now().UnixNano())),
+		Mutex: sync.Mutex{},
 	}, nil
 }
 
-func (y *Yeelight) randID() int {
-	i := y.rnd.Intn(100)
-	return i
-}
+// Send given Method and args to current yeelight device
+func (y *yeelight) Send(method Method, args ...interface{}) (*Response, error) {
+	y.Lock()
+	defer y.Unlock()
 
-func (y *Yeelight) send(method method, args ...interface{}) (*commandResult, error) {
-	y.mu.Lock()
-	defer y.mu.Unlock()
-
-	// Create command
 	cmd := command{
-		ID:     y.randID(),
-		Method: method.String(),
+		ID:     y.rnd.Intn(100),
+		Method: method,
 		Params: args,
 	}
 
 	conn, err := net.Dial("tcp", y.addr)
 	if err != nil {
-		return nil, fmt.Errorf("could not dial address: %s", err)
+		return nil, fmt.Errorf("[%s] cannot dial with %s: %w", y.name, y.addr, err)
 	}
 	defer conn.Close()
 
-	time.Sleep(time.Second)
-	conn.SetReadDeadline(time.Now().Add(timeout))
-
-	// Write command
 	b, _ := json.Marshal(cmd)
-	fmt.Fprint(conn, string(b)+crlf)
-
-	// Wait and read for response
-	var rs commandResult
-	res, err := bufio.NewReader(conn).ReadString('\n')
-	err = json.Unmarshal([]byte(res), &rs)
-
-	if nil != err {
-		return nil, fmt.Errorf("cannot parse command result %s", err)
+	if _, err := fmt.Fprint(conn, string(b)+crlf); err != nil {
+		return nil, fmt.Errorf("[%s] cannot execute command: %w", y.name, err)
 	}
-	if nil != rs.Error {
-		return nil, fmt.Errorf("command execution error. Code: %d, Message: %s", rs.Error.Code, rs.Error.Message)
+
+	// Wait and read for Response
+	var rs Response
+	if err := json.NewDecoder(conn).Decode(&rs); err != nil {
+		return nil, fmt.Errorf("[%s] cannot parse command result %w", y.name, err)
+	}
+
+	if rs.Error != nil {
+		return nil, fmt.Errorf("[%s] command execution error, received %v", y.name, rs.Error)
 	}
 
 	return &rs, nil
 }
 
-// TurnOn will turn the light yeelight on.
-func (y *Yeelight) TurnOn() error {
-	_, err := y.send(MethodSetPower, "on")
+func (y *yeelight) Listen(ctx context.Context) (<-chan *Notification, error) {
+	conn, err := net.DialTimeout("tcp", y.addr, time.Second*3)
+	if err != nil {
+		return nil, fmt.Errorf("[%s] cannot dial with %s: %w", y.name, y.addr, err)
+	}
+
+	var notificationsCh = make(chan *Notification)
+	go func(c net.Conn) {
+		defer c.Close()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				// Wait and read for Notification
+				var notif Notification
+				if err := json.NewDecoder(c).Decode(&notif); err == nil {
+					notificationsCh <- &notif
+				}
+			}
+		}
+	}(conn)
+
+	return notificationsCh, nil
+}
+
+func (y *yeelight) On() error {
+	_, err := y.Send(SetPower, "on")
 	return err
 }
 
-// TurnOff will turn the light yeelight off.
-func (y *Yeelight) TurnOff() error {
-	_, err := y.send(MethodSetPower, "off")
+func (y *yeelight) Off() error {
+	_, err := y.Send(SetPower, "off")
 	return err
 }
 
-// ColorTemp will set the light yeelight color temperature
-func (y *Yeelight) ColorTemp(temp int) error {
+func (y *yeelight) SetColorTemperature(temp uint16) error {
 	switch {
 	case temp < 1700:
 		temp = 1700
 	case temp > 6500:
 		temp = 6500
 	}
-	_, err := y.send(MethodSetCTABX, temp)
+	_, err := y.Send(SetCTABX, temp)
 	return err
 }
 
-// RGB will set the light yeelight red, green and blue values.
-func (y *Yeelight) RGB(red, green, blue int) error {
-	_, err := y.send(MethodSetRGB, red<<16+green<<8+blue)
+func (y *yeelight) SetRGB(red, green, blue uint8) error {
+	r := uint32(red) << 16
+	g := uint32(green) << 8
+	b := uint32(blue)
+	_, err := y.Send(SetRGB, r+g+b)
 	return err
 }
 
-// Brightness will set the light yeelight brightness.
-func (y *Yeelight) Brightness(brightness int) error {
+func (y *yeelight) GetRGB() (uint8, uint8, uint8, error) {
+	panic("implement me")
+}
+
+func (y *yeelight) SetBrightness(brightness uint8) error {
 	switch {
 	case brightness > 100:
 		brightness = 100
 	case brightness < 1:
 		brightness = 1
 	}
-	_, err := y.send(MethodSetBrightness, brightness)
+	_, err := y.Send(SetBrightness, brightness)
 	return err
 }
 
-// IsPowerOn return whether the yeelight is power on
-func (y *Yeelight) IsPowerOn() (bool, error) {
-	resp, err := y.send(MethodGetProp, "power")
+func (y *yeelight) IsPowerOn() (bool, error) {
+	resp, err := y.Send(GetProp, "power")
 	if err != nil {
 		return false, err
 	}
 
 	return resp.Result[0] == "on", err
+}
+
+func (y *yeelight) Toggle() error {
+	_, err := y.Send(Toggle)
+	return err
 }
